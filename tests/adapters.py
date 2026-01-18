@@ -561,7 +561,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    from cs336_basics.tokenizer import Tokenizer
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -710,6 +711,7 @@ def pretokenize(text: str, special_tokens: list[str]):
     for part in parts:
         if not part:
             continue
+        # TODO: Should we capture special tokens?
         for m in re.finditer(PAT, part):
             yield m.group(0)
 
