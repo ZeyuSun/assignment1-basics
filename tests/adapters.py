@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 import regex as re
-from typing import IO, Any, BinaryIO, Counter
+from typing import IO, Any, BinaryIO
+from collections import Counter, defaultdict
 
 import numpy.typing as npt
 import torch
@@ -604,18 +605,17 @@ def run_train_bpe(
         pretoken_cnt[word2byte(pretoken)] += 1
 
     # Perform BPE merging iterations
+    # Count pair frequencies (within pre-tokens only)
+    pair2pretokens: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
+    pair_cnt = Counter()
+    for pretoken, cnt in pretoken_cnt.items():
+        for i in range(len(pretoken) - 1):
+            pair = (pretoken[i], pretoken[i + 1])
+            pair_cnt[pair] += cnt
+            pair2pretokens[pair].add(pretoken)
+
     merges = []
     while len(vocab) < vocab_size:
-        # Count pair frequencies (within pre-tokens only)
-        pair_cnt = Counter()
-        for pretoken, cnt in pretoken_cnt.items():
-            for i in range(len(pretoken) - 1):
-                pair = (pretoken[i], pretoken[i + 1])
-                pair_cnt[pair] += cnt
-
-        if not pair_cnt:
-            break
-
         # Find the most frequent pair, with lexicographic tie-breaking on the bytes
         sort_key = lambda pair: (pair_cnt[pair], pair[0], pair[1])
         best_pair = max(pair_cnt.keys(), key=sort_key)
@@ -626,21 +626,36 @@ def run_train_bpe(
         vocab[len(vocab)] = new_token
 
         # Update pretoken_cnt with the merge
-        new_pretoken_cnt = {}
-        for pretoken, cnt in pretoken_cnt.items():
+        for pretoken in pair2pretokens[best_pair]:
+            cnt = pretoken_cnt[pretoken]
+
+            # revert pair_cnt for the pretoken before merge
+            for i in range(len(pretoken) - 1):
+                pair = (pretoken[i], pretoken[i + 1])
+                pair_cnt[pair] -= cnt
+
+            # merge best_pair in pretoken
             new_seq = list(pretoken)
-            # Replace all occurrences of best_pair with new merged token
             i = 0
             while i < len(new_seq) - 1:
-                #### Tuple and list initialization is inefficient
-                # if (new_seq[i], new_seq[i + 1]) == best_pair:
-                #   new_seq = new_seq[:i] + [new_token] + new_seq[i + 2:]
                 if new_seq[i] == best_pair[0] and new_seq[i + 1] == best_pair[1]:
                     new_seq[i : i + 2] = [new_token]
                 else:
                     i += 1
-            new_pretoken_cnt[tuple(new_seq)] = cnt
-        pretoken_cnt = new_pretoken_cnt
+
+            # update pretoken_cnt
+            del pretoken_cnt[pretoken]
+            pretoken_cnt[tuple(new_seq)] = cnt
+
+            # update pair_cnt and pair2pretokens
+            for i in range(len(new_seq) - 1):
+                pair = (new_seq[i], new_seq[i + 1])
+                pair_cnt[pair] += cnt
+                pair2pretokens[pair].add(tuple(new_seq))
+
+        # Remove best_pair from pair_cnt and pair2pretokens
+        del pair_cnt[best_pair]
+        del pair2pretokens[best_pair]
 
     return vocab, merges
 
@@ -666,17 +681,16 @@ def initialize_vocab(special_tokens: list[str]) -> dict[int, bytes]:
 
     return vocab
 
-def pretokenize(text: str, special_tokens: list[str]) -> list[tuple[int, ...]]:
-    """Pre-tokenize input text into sequences of byte indices.
+
+def pretokenize(text: str, special_tokens: list[str]):
+    """Pre-tokenize input text into sequences of byte indices (generator).
 
     Args:
         text (str): Input text to pre-tokenize.
         special_tokens (list[str]): A list of string special tokens to be treated as single tokens.
 
-    Returns:
-        list[tuple[int, ...]]: List of pre-tokenized sequences, each represented as a tuple of byte indices.
-
-    TODO: finditer
+    Yields:
+        str: Pre-tokenized strings one at a time.
     """
     # Pre-tokenization using GPT-2 regex pattern
     # Pattern from https://github.com/openai/tiktoken/pull/234/files
@@ -684,19 +698,21 @@ def pretokenize(text: str, special_tokens: list[str]) -> list[tuple[int, ...]]:
 
     # if no special tokens, use simple regex matching
     if not special_tokens:
-        return re.findall(PAT, text)
+        for m in re.finditer(PAT, text):
+            yield m.group(0)
+        return
 
     # sort special tokens by length descending to match longer tokens first
     special_tokens = sorted(special_tokens, key=len, reverse=True)
     union = "|".join(re.escape(token) for token in special_tokens)
     parts = re.split(f"{union}", text)
 
-    pretokens = []
     for part in parts:
         if not part:
             continue
-        pretokens.extend(re.findall(PAT, part))
-    return pretokens
+        for m in re.finditer(PAT, part):
+            yield m.group(0)
+
 
 def word2byte(word: str) -> tuple[bytes, ...]:
     """Convert a word to a tuple of byte sequences.
